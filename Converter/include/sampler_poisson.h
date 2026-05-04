@@ -15,6 +15,8 @@ struct SamplerPoisson : public Sampler {
 		function<void(Node*)> onNodeCompleted, 
 		function<void(Node*)> onNodeDiscarded
 	) {
+		constexpr int64_t minNodeBytes = 16 * 1024;
+		constexpr int64_t maxParentPointsAfterAbsorb = 30'000;
 
 		struct Point {
 			double x;
@@ -39,7 +41,7 @@ struct SamplerPoisson : public Sampler {
 		Vector3 scale = attributes.posScale;
 		Vector3 offset = attributes.posOffset;
 
-		traversePost(node, [bytesPerPoint, baseSpacing, scale, offset, &onNodeCompleted, &onNodeDiscarded, attributes](Node* node) {
+		traversePost(node, [bytesPerPoint, baseSpacing, scale, offset, &onNodeCompleted, &onNodeDiscarded, attributes, minNodeBytes, maxParentPointsAfterAbsorb](Node* node) {
 			node->sampled = true;
 
 			int64_t numPoints = node->numPoints;
@@ -77,6 +79,7 @@ struct SamplerPoisson : public Sampler {
 
 			vector<vector<int8_t>> acceptedChildPointFlags;
 			vector<int64_t> numRejectedPerChild(8, 0);
+			vector<int8_t> absorbRejectedIntoParent(8, 0);
 			int64_t numAccepted = 0;
 
 			for (int64_t childIndex = 0; childIndex < 8; childIndex++) {
@@ -100,7 +103,7 @@ struct SamplerPoisson : public Sampler {
 					double y = (xyz[1] * scale.y) + offset.y;
 					double z = (xyz[2] * scale.z) + offset.z;
 
-					Point point = { x, y, z, i, childIndex };
+					Point point = { x, y, z, int32_t(i), int32_t(childIndex) };
 
 					points.push_back(point);
 				}
@@ -244,7 +247,7 @@ struct SamplerPoisson : public Sampler {
 
 			}
 
-			auto accepted = make_shared<Buffer>(numAccepted * attributes.bytes);
+			int64_t absorbedRejectedPoints = 0;
 			for (int64_t childIndex = 0; childIndex < 8; childIndex++) {
 				auto child = node->children[childIndex];
 
@@ -253,14 +256,37 @@ struct SamplerPoisson : public Sampler {
 				}
 
 				auto numRejected = numRejectedPerChild[childIndex];
+				auto rejectedBytes = numRejected * attributes.bytes;
+				auto parentPointsAfterAbsorb = numAccepted + absorbedRejectedPoints + numRejected;
+
+				bool shouldAbsorb = numRejected > 0
+					&& rejectedBytes < minNodeBytes
+					&& parentPointsAfterAbsorb <= maxParentPointsAfterAbsorb;
+
+				if (shouldAbsorb) {
+					absorbRejectedIntoParent[childIndex] = 1;
+					absorbedRejectedPoints += numRejected;
+				}
+			}
+
+			auto accepted = make_shared<Buffer>((numAccepted + absorbedRejectedPoints) * attributes.bytes);
+			for (int64_t childIndex = 0; childIndex < 8; childIndex++) {
+				auto child = node->children[childIndex];
+
+				if (child == nullptr) {
+					continue;
+				}
+
+				auto numRejected = numRejectedPerChild[childIndex];
+				auto absorbRejected = absorbRejectedIntoParent[childIndex] != 0;
 				auto& acceptedFlags = acceptedChildPointFlags[childIndex];
-				auto rejected = make_shared<Buffer>(numRejected * attributes.bytes);
+				auto rejected = absorbRejected ? nullptr : make_shared<Buffer>(numRejected * attributes.bytes);
 
 				for (int64_t i = 0; i < child->numPoints; i++) {
 					auto isAccepted = acceptedFlags[i];
 					int64_t pointOffset = i * attributes.bytes;
 
-					if (isAccepted) {
+					if (isAccepted || absorbRejected) {
 						accepted->write(child->points->data_u8 + pointOffset, attributes.bytes);
 						// rejected->write(child->points->data_u8 + pointOffset, attributes.bytes);
 					} else {
@@ -268,16 +294,16 @@ struct SamplerPoisson : public Sampler {
 					}
 				}
 
-				if (numRejected == 0 && child->isLeaf()) {
+				if ((numRejected == 0 || absorbRejected) && child->isLeaf()) {
 					onNodeDiscarded(child.get());
 
 					node->children[childIndex] = nullptr;
-				} if (numRejected > 0) {
+				} else if (numRejected > 0 && !absorbRejected) {
 					child->points = rejected;
 					child->numPoints = numRejected;
 
 					onNodeCompleted(child.get());
-				} else if(numRejected == 0) {
+				} else if(numRejected == 0 || absorbRejected) {
 					// the parent has taken all points from this child, 
 					// so make this child an empty inner node.
 					// Otherwise, the hierarchy file will claim that 
@@ -291,7 +317,7 @@ struct SamplerPoisson : public Sampler {
 			}
 
 			node->points = accepted;
-			node->numPoints = numAccepted;
+			node->numPoints = numAccepted + absorbedRejectedPoints;
 
 			//{ // debug
 			//	auto avgChecks = dbgSumChecks / points.size();

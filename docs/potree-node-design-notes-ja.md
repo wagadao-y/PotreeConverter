@@ -665,6 +665,58 @@ converter 改善を採用するなら、少なくとも次を満たしたい。
 
 ここで重要なのは、tiny node を消すために巨大 node を作りすぎないことだ。評価の目的は「全部を大きい node に寄せること」ではなく、「runtime に不利な極小 node を抑えつつ、LOD 品質を保つこと」である。
 
+## 実施結果メモ 2026-05-04
+
+`testing/test-data/mp_e57_Mechanical-room.laz` を使って、`poisson` sampling に tiny remainder 吸収を入れた版を評価した。
+
+実装ルール:
+
+```text
+- rejectedBytes < 16KB の child remainder は親へ吸収する
+- ただし吸収後の parent points が 30,000 を超える場合は吸収しない
+```
+
+### converter 側の結果
+
+baseline と改善版の `potree-node-stats` 比較では、以下の改善を確認した。
+
+```text
+total nodes:            54,843 -> 23,095
+leaf nodes:             45,479 -> 16,829
+leaf tiny <= 1KB:       13,500 -> 256
+leaf small <= 16KB:     32,364 -> 722
+leaf zero-point:         8,737 -> 0
+inner zero payload:         89 -> 20
+inner small <= 16KB:        89 -> 25
+conversion duration:     62.6s -> 56.9s
+```
+
+読み方として重要なのは、payload 総量は大きく変えずに、viewer に不利な極小 leaf を大きく減らせた点である。
+
+### viewer 実測の結果
+
+同一視点・同一点予算で viewer 実測も行い、以下の改善を確認した。
+
+```text
+visible nodes:      3,334 -> 1,630
+draw calls PC:      3,334 -> 1,630
+CPU work avg:      16.50 -> 7.14 ms
+update avg:         4.80 -> 2.23 ms
+render avg:        11.60 -> 4.86 ms
+GPU time avg:      10.07 -> 7.75 ms
+fetch events:       3,642 -> 1,664
+octree read avg:    6.83 -> 1.48 ms
+hierarchy load avg:13.33 -> 2.14 ms
+```
+
+`Fetched bytes` はほぼ同じだったため、効いているのは総転送量削減ではなく、細切れ node に伴う fetch / decode / draw call の固定費削減と考えてよい。
+
+### 今回の結論
+
+今回の tiny remainder 吸収は、`potree-node-stats` と viewer 実測の両方で改善が確認できたため、採用に値する小改善と判断できる。
+
+一方で、残る sparse inner は主に hierarchy を成立させるための structural placeholder であり、tiny leaf と同じ優先度ではない。viewer 側で draw call を大きく増やす性質でもないため、現時点では無理に collapse しない判断が妥当である。
+
 ## 推奨する進め方
 
 今の段階なら、改善検討は次の順序が現実的である。

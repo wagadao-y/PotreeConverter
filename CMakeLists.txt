@@ -5,7 +5,12 @@ project(PotreeConverter LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 #message(${PROJECT_SOURCE_DIR})
 
@@ -52,6 +57,14 @@ target_include_directories(PotreeConverter PRIVATE "./Converter/include")
 target_include_directories(PotreeConverter PRIVATE "./Converter/modules")
 target_include_directories(PotreeConverter PRIVATE "./Converter/libs")
 
+if (MSVC)
+	target_compile_definitions(PotreeConverter PRIVATE
+		_CRT_SECURE_NO_WARNINGS
+		NOMINMAX
+		WIN32_LEAN_AND_MEAN
+	)
+	target_link_libraries(PotreeConverter Psapi)
+endif()
 
 if (UNIX)
 	find_package(Threads REQUIRED)
@@ -77,6 +90,11 @@ add_custom_command(
 ###############################################
 # COPY LICENSE FILES TO BINARY DIRECTORY
 ###############################################
+add_custom_command(
+	TARGET PotreeConverter POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E make_directory
+		$<TARGET_FILE_DIR:${PROJECT_NAME}>/licenses)
+
 add_custom_command(
 	TARGET PotreeConverter POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy
@@ -106,4 +124,3 @@ add_custom_command(
 	COMMAND ${CMAKE_COMMAND} -E copy
 		${PROJECT_SOURCE_DIR}/README.md
 		$<TARGET_FILE_DIR:${PROJECT_NAME}>/README.md)
-

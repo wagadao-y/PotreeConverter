@@ -15,7 +15,7 @@ struct SamplerPoisson : public Sampler {
 		function<void(Node*)> onNodeCompleted, 
 		function<void(Node*)> onNodeDiscarded
 	) {
-		constexpr int64_t minNodeBytes = 16 * 1024;
+		constexpr int64_t minNodePoints = 2'000;
 		constexpr int64_t maxParentPointsAfterAbsorb = 30'000;
 
 		struct Point {
@@ -41,7 +41,7 @@ struct SamplerPoisson : public Sampler {
 		Vector3 scale = attributes.posScale;
 		Vector3 offset = attributes.posOffset;
 
-		traversePost(node, [bytesPerPoint, baseSpacing, scale, offset, &onNodeCompleted, &onNodeDiscarded, attributes, minNodeBytes, maxParentPointsAfterAbsorb](Node* node) {
+		traversePost(node, [bytesPerPoint, baseSpacing, scale, offset, &onNodeCompleted, &onNodeDiscarded, attributes, minNodePoints, maxParentPointsAfterAbsorb](Node* node) {
 			node->sampled = true;
 
 			int64_t numPoints = node->numPoints;
@@ -256,11 +256,10 @@ struct SamplerPoisson : public Sampler {
 				}
 
 				auto numRejected = numRejectedPerChild[childIndex];
-				auto rejectedBytes = numRejected * attributes.bytes;
 				auto parentPointsAfterAbsorb = numAccepted + absorbedRejectedPoints + numRejected;
 
 				bool shouldAbsorb = numRejected > 0
-					&& rejectedBytes < minNodeBytes
+					&& numRejected < minNodePoints
 					&& parentPointsAfterAbsorb <= maxParentPointsAfterAbsorb;
 
 				if (shouldAbsorb) {

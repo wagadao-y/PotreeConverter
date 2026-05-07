@@ -28,6 +28,7 @@ Options parseArguments(int argc, char** argv) {
 	args.addArgument("method,m", "Point sampling method \"poisson\", \"poisson_average\", \"random\"");
 	args.addArgument("chunkMethod", "Chunking method");
 	args.addArgument("keep-chunks", "Skip deleting temporary chunks during conversion");
+	args.addArgument("optimize-octree-layout", "Reorder octree.bin post-process to improve spatial locality for Potree 2 viewer access patterns");
 	args.addArgument("no-chunking", "Disable chunking phase");
 	args.addArgument("no-indexing", "Disable indexing phase");
 	args.addArgument("attributes", "Attributes in output file");
@@ -115,6 +116,7 @@ Options parseArguments(int argc, char** argv) {
 	string projection = args.get("projection").as<string>();
 
 	bool keepChunks = args.has("keep-chunks");
+	bool optimizeOctreeLayout = args.has("optimize-octree-layout");
 	bool noChunking = args.has("no-chunking");
 	bool noIndexing = args.has("no-indexing");
 
@@ -132,6 +134,7 @@ Options parseArguments(int argc, char** argv) {
 	options.projection = projection;
 
 	options.keepChunks = keepChunks;
+	options.optimizeOctreeLayout = optimizeOctreeLayout;
 	options.noChunking = noChunking;
 	options.noIndexing = noIndexing;
 

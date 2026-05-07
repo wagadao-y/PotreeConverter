@@ -2,6 +2,8 @@
 #include <cerrno>
 #include <execution>
 #include <algorithm>
+#include <system_error>
+#include <stdexcept>
 
 #include "indexer.h"
 
@@ -197,6 +199,386 @@ namespace indexer{
 		flushedChunkRoots.push_back(fcr);
 
 		offset += size;
+	}
+
+	struct HierarchyRecord {
+		string name;
+		uint32_t numPoints = 0;
+		uint64_t byteOffset = 0;
+		uint32_t byteSize = 0;
+	};
+
+	static inline string parseHierarchyRecordName(const char* ptr31) {
+		string nodeName(ptr31, 31);
+		nodeName = stringReplace(nodeName, " ", "");
+		nodeName.erase(std::remove(nodeName.begin(), nodeName.end(), ' '), nodeName.end());
+		return nodeName;
+	}
+
+	static vector<string> listHierarchyChunkFiles(const string& hierarchyDir) {
+		vector<string> files;
+		for (auto& entry : fs::directory_iterator(hierarchyDir)) {
+			auto filepath = entry.path();
+			if (!iEndsWith(filepath.string(), ".bin")) continue;
+			files.push_back(filepath.string());
+		}
+		return files;
+	}
+
+	static bool removePathIfExists(const fs::path& path) {
+		std::error_code ec;
+		bool exists = fs::exists(path, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: could not inspect path " + path.string() + ": " + ec.message());
+			return false;
+		}
+
+		if (!exists) {
+			return true;
+		}
+
+		fs::remove_all(path, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: could not remove path " + path.string() + ": " + ec.message());
+			return false;
+		}
+
+		return true;
+	}
+
+	static bool renamePath(const fs::path& source, const fs::path& target, const string& context) {
+		std::error_code ec;
+		fs::rename(source, target, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: " + context + ": " + ec.message());
+			return false;
+		}
+
+		return true;
+	}
+
+	static bool prepareBackupPath(const fs::path& originalPath, const fs::path& backupPath) {
+		std::error_code ec;
+		bool originalExists = fs::exists(originalPath, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: could not inspect path " + originalPath.string() + ": " + ec.message());
+			return false;
+		}
+
+		bool backupExists = fs::exists(backupPath, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: could not inspect backup path " + backupPath.string() + ": " + ec.message());
+			return false;
+		}
+
+		if (!backupExists) {
+			return true;
+		}
+
+		if (!originalExists) {
+			logger::ERROR("optimize layout failed: stale backup path requires manual cleanup: " + backupPath.string());
+			return false;
+		}
+
+		return removePathIfExists(backupPath);
+	}
+
+	static bool loadUniqueHierarchyRecords(
+		const string& hierarchyDir,
+		unordered_map<string, HierarchyRecord>& unique
+	) {
+		auto files = listHierarchyChunkFiles(hierarchyDir);
+
+		for (auto& file : files) {
+			auto buffer = readBinaryFile(file);
+			if (buffer->size % 48 != 0) {
+				logger::ERROR("invalid hierarchy chunk file size (not multiple of 48): " + file);
+				return false;
+			}
+
+			int64_t numRecords = buffer->size / 48;
+			for (int64_t i = 0; i < numRecords; i++) {
+				int64_t recordOffset = 48 * i;
+				HierarchyRecord rec;
+				rec.name = parseHierarchyRecordName(buffer->data_char + recordOffset);
+				if (rec.name.size() == 0) continue;
+				rec.numPoints = buffer->get<uint32_t>(recordOffset + 31);
+				rec.byteOffset = buffer->get<uint64_t>(recordOffset + 35);
+				rec.byteSize = buffer->get<uint32_t>(recordOffset + 43);
+
+				auto it = unique.find(rec.name);
+				if (it == unique.end()) {
+					unique[rec.name] = rec;
+				} else {
+					if (it->second.byteSize != rec.byteSize || it->second.numPoints != rec.numPoints) {
+						logger::ERROR("inconsistent hierarchy records for node " + rec.name);
+						return false;
+					}
+				}
+			}
+		}
+
+		return true;
+	}
+
+	static bool writeHierarchyChunkFilesWithNewOffsets(
+		const string& sourceHierarchyDir,
+		const fs::path& targetHierarchyDir,
+		const unordered_map<string, uint64_t>& newOffsets
+	) {
+		if (!removePathIfExists(targetHierarchyDir)) {
+			return false;
+		}
+
+		std::error_code ec;
+		fs::create_directories(targetHierarchyDir, ec);
+		if (ec) {
+			logger::ERROR("optimize layout failed: could not create temp hierarchy dir " + targetHierarchyDir.string() + ": " + ec.message());
+			return false;
+		}
+
+		auto files = listHierarchyChunkFiles(sourceHierarchyDir);
+		for (auto& file : files) {
+			auto buffer = readBinaryFile(file);
+			if (buffer->size % 48 != 0) {
+				logger::ERROR("invalid hierarchy chunk file size (not multiple of 48): " + file);
+				return false;
+			}
+
+			int64_t numRecords = buffer->size / 48;
+			for (int64_t i = 0; i < numRecords; i++) {
+				int64_t recordOffset = 48 * i;
+				string nodeName = parseHierarchyRecordName(buffer->data_char + recordOffset);
+				if (nodeName.size() == 0) continue;
+
+				auto it = newOffsets.find(nodeName);
+				if (it == newOffsets.end()) {
+					continue;
+				}
+
+				buffer->set<uint64_t>(it->second, recordOffset + 35);
+			}
+
+			fs::path sourcePath(file);
+			fs::path targetPath = targetHierarchyDir / sourcePath.filename();
+			fstream fout(targetPath.string(), ios::out | ios::binary | ios::trunc);
+			if (!fout.is_open()) {
+				logger::ERROR("optimize layout failed: could not open temp hierarchy chunk " + targetPath.string());
+				return false;
+			}
+
+			fout.write(buffer->data_char, buffer->size);
+			if (!fout.good()) {
+				logger::ERROR("optimize layout failed: could not write temp hierarchy chunk " + targetPath.string());
+				return false;
+			}
+
+			fout.close();
+		}
+
+		return true;
+	}
+
+	static bool writeOptimizedOctree(
+		const fs::path& octreePath,
+		const fs::path& tmpOctreePath,
+		const unordered_map<string, HierarchyRecord>& records,
+		const vector<string>& ordered,
+		unordered_map<string, uint64_t>& newOffsets
+	) {
+		if (!removePathIfExists(tmpOctreePath)) {
+			return false;
+		}
+
+		fstream fin(octreePath.string(), ios::in | ios::binary);
+		fstream fout(tmpOctreePath.string(), ios::out | ios::binary | ios::trunc);
+		if (!fin.is_open() || !fout.is_open()) {
+			logger::ERROR("optimize layout failed: could not open octree files");
+			return false;
+		}
+
+		newOffsets.clear();
+		newOffsets.reserve(records.size());
+
+		uint64_t outOffset = 0;
+		for (auto& name : ordered) {
+			auto itRecord = records.find(name);
+			if (itRecord == records.end()) {
+				logger::ERROR("optimize layout failed: missing hierarchy record for node " + name);
+				return false;
+			}
+
+			auto& rec = itRecord->second;
+			if (rec.byteSize == 0) {
+				continue;
+			}
+
+			auto buffer = make_shared<Buffer>(rec.byteSize);
+			fin.seekg(rec.byteOffset);
+			if (!fin.good()) {
+				logger::ERROR("optimize layout failed while seeking node " + name);
+				return false;
+			}
+
+			fin.read(buffer->data_char, rec.byteSize);
+			if (!fin.good()) {
+				logger::ERROR("optimize layout failed while reading node " + name);
+				return false;
+			}
+
+			fout.write(buffer->data_char, rec.byteSize);
+			if (!fout.good()) {
+				logger::ERROR("optimize layout failed while writing node " + name);
+				return false;
+			}
+
+			newOffsets[name] = outOffset;
+			outOffset += rec.byteSize;
+		}
+
+		fout.close();
+		fin.close();
+
+		return true;
+	}
+
+	static bool commitOptimizedOctreeLayout(
+		const fs::path& octreePath,
+		const fs::path& hierarchyDir,
+		const fs::path& tmpOctreePath,
+		const fs::path& tmpHierarchyDir
+	) {
+		fs::path backupOctreePath = octreePath.string() + ".optimize_backup";
+		fs::path backupHierarchyDir = hierarchyDir.string() + ".optimize_backup";
+
+		if (!prepareBackupPath(octreePath, backupOctreePath)) {
+			return false;
+		}
+
+		if (!prepareBackupPath(hierarchyDir, backupHierarchyDir)) {
+			return false;
+		}
+
+		bool octreeMovedToBackup = false;
+		bool hierarchyMovedToBackup = false;
+		bool newOctreeInstalled = false;
+		bool newHierarchyInstalled = false;
+
+		auto rollback = [&]() {
+			if (newHierarchyInstalled) {
+				removePathIfExists(hierarchyDir);
+			}
+
+			if (newOctreeInstalled) {
+				removePathIfExists(octreePath);
+			}
+
+			if (hierarchyMovedToBackup) {
+				std::error_code existsEc;
+				bool hierarchyExists = fs::exists(hierarchyDir, existsEc);
+				if (!existsEc && !hierarchyExists) {
+					renamePath(backupHierarchyDir, hierarchyDir, "could not restore hierarchy chunks");
+				}
+			}
+
+			if (octreeMovedToBackup) {
+				std::error_code existsEc;
+				bool octreeExists = fs::exists(octreePath, existsEc);
+				if (!existsEc && !octreeExists) {
+					renamePath(backupOctreePath, octreePath, "could not restore octree.bin");
+				}
+			}
+		};
+
+		if (!renamePath(octreePath, backupOctreePath, "could not move octree.bin to backup")) {
+			rollback();
+			return false;
+		}
+		octreeMovedToBackup = true;
+
+		if (!renamePath(hierarchyDir, backupHierarchyDir, "could not move hierarchy chunks to backup")) {
+			rollback();
+			return false;
+		}
+		hierarchyMovedToBackup = true;
+
+		if (!renamePath(tmpOctreePath, octreePath, "could not install optimized octree.bin")) {
+			rollback();
+			return false;
+		}
+		newOctreeInstalled = true;
+
+		if (!renamePath(tmpHierarchyDir, hierarchyDir, "could not install optimized hierarchy chunks")) {
+			rollback();
+			return false;
+		}
+		newHierarchyInstalled = true;
+
+		if (!removePathIfExists(backupOctreePath)) {
+			logger::WARN("optimized octree.bin committed but backup cleanup failed: " + backupOctreePath.string());
+		}
+
+		if (!removePathIfExists(backupHierarchyDir)) {
+			logger::WARN("optimized hierarchy committed but backup cleanup failed: " + backupHierarchyDir.string());
+		}
+
+		return true;
+	}
+
+	static bool optimizeOctreeLayoutPostProcess(const string& targetDir) {
+		fs::path hierarchyDir = fs::path(targetDir) / ".hierarchyChunks";
+		fs::path octreePath = fs::path(targetDir) / "octree.bin";
+		fs::path tmpOctreePath = octreePath.string() + ".optimize_tmp";
+		fs::path tmpHierarchyDir = hierarchyDir.string() + ".optimize_tmp";
+
+		if (!fs::exists(hierarchyDir) || !fs::exists(octreePath)) {
+			logger::ERROR("optimize layout skipped: missing hierarchy dir or octree.bin");
+			return false;
+		}
+
+		unordered_map<string, HierarchyRecord> records;
+		if (!loadUniqueHierarchyRecords(hierarchyDir.string(), records)) {
+			removePathIfExists(tmpOctreePath);
+			removePathIfExists(tmpHierarchyDir);
+			return false;
+		}
+
+		if (records.size() == 0) {
+			logger::ERROR("optimize layout skipped: no hierarchy records");
+			return false;
+		}
+
+		vector<string> ordered;
+		ordered.reserve(records.size());
+		for (auto& [name, rec] : records) {
+			ordered.push_back(name);
+		}
+
+		sort(ordered.begin(), ordered.end(), [](const string& a, const string& b) {
+			if (a.size() != b.size()) return a.size() < b.size();
+			return a < b;
+		});
+
+		unordered_map<string, uint64_t> newOffsets;
+		if (!writeOptimizedOctree(octreePath, tmpOctreePath, records, ordered, newOffsets)) {
+			removePathIfExists(tmpOctreePath);
+			removePathIfExists(tmpHierarchyDir);
+			return false;
+		}
+
+		if (!writeHierarchyChunkFilesWithNewOffsets(hierarchyDir.string(), tmpHierarchyDir, newOffsets)) {
+			removePathIfExists(tmpOctreePath);
+			removePathIfExists(tmpHierarchyDir);
+			return false;
+		}
+
+		if (!commitOptimizedOctreeLayout(octreePath, hierarchyDir, tmpOctreePath, tmpHierarchyDir)) {
+			removePathIfExists(tmpOctreePath);
+			removePathIfExists(tmpHierarchyDir);
+			return false;
+		}
+
+		return true;
 	}
 
 	vector<CRNode> Indexer::processChunkRoots(){
@@ -1756,6 +2138,13 @@ void doIndexing(string targetDir, State& state, Options& options, Sampler& sampl
 	//writeBinaryFile(hierarchyPath, hierarchy.buffer);
 
 	indexer.hierarchyFlusher->flush(hierarchyStepSize);
+
+	if (options.optimizeOctreeLayout) {
+		logger::INFO("optimizing octree.bin layout (post-process)");
+		if (!optimizeOctreeLayoutPostProcess(targetDir)) {
+			throw std::runtime_error("octree layout optimization failed");
+		}
+	}
 
 	string hierarchyDir = indexer.targetDir + "/.hierarchyChunks";
 	HierarchyBuilder builder(hierarchyDir, hierarchyStepSize);

@@ -754,3 +754,237 @@ task 3: raw / 改善版の node stats を比較する
 task 4: viewer 上の見た目と応答感を確認する
 task 5: 必要なら inner payload 改善へ進む
 ```
+
+## 追記: lodLevel 属性による点サイズ補正案
+
+小ノードを親へ吸い上げる方式には、viewer 表示上の副作用がある。
+
+Potree viewer の `ADAPTIVE` 点サイズは、単純に「点が格納されている node の level」だけで決まるわけではない。shader 側では visible node texture を使い、点の位置に可視の子孫 node が存在する場合、その領域をより細かい LOD とみなして親 node の点も小さく描画する。
+
+つまり、通常の Potree 表示では以下のような挙動になる。
+
+```text
+親 node level 4 が表示される
+  その一部領域に子 node level 5 も表示される
+    子 node の bbox 内では、親 node の点も level 5 相当の小さい点サイズに寄る
+```
+
+一方、小ノード改善で子 node を親へ吸収して hierarchy 上から消すと、viewer からはその子 node が見えなくなる。
+
+```text
+親 node level 4 が表示される
+  子 node level 5 は吸収済みで存在しない
+    元子 node 領域の点も、親 node level 4 相当の点サイズで描かれやすい
+```
+
+このため、吸収した点や、吸収された子 node の bbox に含まれる親 node 側の点が、本来より大きい点サイズで描かれる可能性がある。
+
+### 基本方針
+
+この副作用を抑える案として、Potree v2 の通常属性として `lodLevel` を追加する。
+
+```json
+{
+  "name": "lodLevel",
+  "description": "Effective LOD level for adaptive point sizing",
+  "size": 1,
+  "numElements": 1,
+  "elementSize": 1,
+  "type": "uint8",
+  "min": [0],
+  "max": [255],
+  "scale": [1],
+  "offset": [0]
+}
+```
+
+`lodLevel` は「現在その点が格納されている node level」ではなく、「その点が描画上どの LOD level 相当の点サイズで描かれるべきか」を表す。
+
+自前 viewer は `lodLevel` が存在する場合だけ、この属性を vertex shader に渡して点サイズ計算に使う。`lodLevel` が存在しないデータでは、従来の Potree adaptive 表示に戻す。
+
+```text
+lodLevel なし:
+  標準 Potree と同じ node / visible node texture ベースの adaptive point size
+
+lodLevel あり:
+  per-point lodLevel を使って effective spacing を決める
+```
+
+概念的な shader 側の計算は以下である。
+
+```glsl
+attribute float lodLevel;
+
+float effectiveSpacing = uOctreeSpacing / pow(2.0, lodLevel);
+float worldSpaceSize = size * effectiveSpacing * 1.7;
+gl_PointSize = clamp(worldSpaceSize * projFactor, minSize, maxSize);
+```
+
+実装時は `uint8` attribute を normalized せずに渡す必要がある。normalized にすると `0..255` が `0..1` に変換され、LOD level として扱えない。
+
+### converter 側で必要な扱い
+
+重要なのは、`lodLevel` を単なる「点の出身 node level」にしないことである。
+
+小ノード吸収がなければ、node 内の全点は基本的に同じ `lodLevel = node.level` でよい。しかし、子 node を親へ吸収する場合、その子 node が本来 shader に与えていた「この領域はより細かい LOD で描くべき」という情報を、どこかに残す必要がある。
+
+そのため、collapse 時には以下のように扱う。
+
+```text
+child を parent へ吸収する
+  吸収された child 点:
+    lodLevel は child 側で確定済みの値を維持する
+
+  child bbox に含まれる parent payload 点:
+    lodLevel = max(current lodLevel, child.level)
+```
+
+多段階吸収が起きる場合も同じ考え方で、より深い LOD を失わないように `max` で伝播する。
+
+```text
+level 6 の点が level 5 へ吸収される
+  lodLevel = 6
+
+さらに level 5 領域が level 4 へ吸収される
+  lodLevel = max(6, 5) = 6
+```
+
+つまり `lodLevel` の最終的な意味は、以下になる。
+
+```text
+lodLevel = collapse 後も保持したい effective LOD level
+```
+
+### 処理時間とメモリへの影響
+
+未圧縮では `lodLevel uint8` により 1 byte/point 増える。
+
+カラー点群の最小構成を以下とすると、
+
+```text
+position: int32 x 3  = 12 bytes
+rgb:      uint16 x 3 =  6 bytes
+total:               = 18 bytes/point
+```
+
+`lodLevel` 追加後は 19 bytes/point になり、未圧縮では約 5.6% 増える。
+
+```text
+1 / 18 = 5.56%
+```
+
+ただし、この converter は圧縮前に Struct of Arrays 形式へ並べ替えて属性ごとに圧縮する。`lodLevel` は node 内で同値または低エントロピーになりやすいため、Brotli 後のサイズ増分は未圧縮の 5.6% より小さくなる可能性が高い。
+
+処理時間については、実装場所が重要である。親 node を後から広範囲に再走査して `lodLevel` を補正する方式は重くなりやすい。一方、現在の bottom-up sampling では、親 payload を作る時点で各点がどの child から来たかを把握しているため、このタイミングで `lodLevel` を更新すれば追加コストは小さい。
+
+```text
+既存:
+  accepted/rejected を判定する
+  point record を accepted buffer または rejected buffer へコピーする
+
+lodLevel 対応:
+  コピー時に lodLevel byte を維持または max 更新する
+```
+
+この方式なら、主な追加コストは以下である。
+
+- 1 byte/point の追加属性
+- sampling 中 buffer の 1 byte/point 増加
+- point copy 時の小さな条件分岐
+- `lodLevel` min/max/histogram の metadata 更新
+
+大幅な処理時間増やメモリ使用量増にはなりにくいと考えられる。ただし、実データでの実測は必要である。
+
+### viewer 側で必要な扱い
+
+自前 viewer 側では、`metadata.json` の attributes に `lodLevel` があるかを検出する。
+
+```text
+lodLevel がない:
+  従来の Potree adaptive point size を使う
+
+lodLevel がある:
+  lodLevel attribute を GPU に渡し、点サイズ計算に使う
+```
+
+注意点は、既存の visible node texture による adaptive 補正と `lodLevel` 補正を二重に効かせないことである。
+
+安全な方針は、`lodLevel` がある場合は点サイズ計算について `lodLevel` を優先し、LOD 選択、visibility、point budget 管理は従来通り node 単位で行うことである。
+
+標準 Potree viewer は `lodLevel` を点サイズには使わない。そのため、この方式は「標準 viewer で見た目まで完全互換」ではない。一方、`lodLevel` は通常属性として追加されるだけなので、データ構造としては Potree v2 の枠内に収まる。
+
+```text
+標準 Potree viewer:
+  lodLevel を無視する
+  吸収点は親 node 相当の点サイズで描かれる可能性がある
+
+自前 viewer:
+  lodLevel を使って点サイズを補正する
+  小ノード吸収による見た目の副作用を抑えられる
+```
+
+### 客観評価
+
+この方式は、完全な標準 Potree viewer 互換を要求しない場合には有力である。
+
+利点:
+
+- Potree v2 の基本ファイル構造を維持できる
+- 小ノード吸収による node 数、fetch 数、decode 数、draw call 数の削減を維持できる
+- 消えた child node が持っていた点サイズ上の LOD 情報を per-point 属性として保持できる
+- `lodLevel` がないデータでは従来表示に戻せる
+- 追加属性は 1 byte/point で、SoA + Brotli では圧縮されやすい可能性が高い
+
+弱点:
+
+- 標準 Potree viewer では点サイズ補正が効かない
+- 対応 viewer と非対応 viewer で見た目が変わる
+- 点サイズは補正できるが、吸収点が親 node と一緒に早くロードされる点は完全には元に戻せない
+- converter 側で `lodLevel` を effective LOD として正しく伝播しないと破綻する
+- viewer 側 shader で既存 adaptive と二重適用しない設計が必要
+
+採用判断としては、以下の条件なら実験する価値が高い。
+
+```text
+- 自前 viewer で配信・描画する
+- 標準 Potree viewer は最低限読めればよい
+- 小ノード削減による runtime 改善が重要
+- 近距離表示の点サイズ破綻を抑えたい
+```
+
+評価時は、少なくとも以下の3系統を比較する。
+
+```text
+1. baseline
+   小ノード吸収なし
+
+2. collapse only
+   小ノード吸収あり、lodLevel なし
+
+3. collapse + lodLevel
+   小ノード吸収あり、lodLevel による点サイズ補正あり
+```
+
+見るべき指標は以下である。
+
+```text
+converter:
+  変換時間
+  octree.bin / hierarchy.bin / metadata.json サイズ
+  total nodes
+  leaf nodes
+  small/tiny node ratio
+  level ごとの node 数と点数
+
+viewer:
+  visible nodes
+  draw calls
+  fetch events
+  decode time
+  CPU update/render time
+  GPU time
+  近距離での点サイズの自然さ
+  子 node collapse 領域の見た目
+```
+
+結論として、`lodLevel uint8` は、Potree v2 互換構造を保ちながら小ノード削減の描画副作用を抑える現実的な拡張案である。完全な標準 viewer 互換ではないが、自前 viewer を前提にできるなら、性能と見た目のバランスが良い。
